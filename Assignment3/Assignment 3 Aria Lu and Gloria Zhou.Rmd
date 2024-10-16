@@ -1,0 +1,223 @@
+---
+title: "Assignment 3"
+author: "Aria Lu and Gloria Zhou"
+date: "2024-10-11"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(xml2)
+library(rvest)
+library(tidyverse)
+```
+
+# Web Scraping
+
+```{r}
+url <- "https://en.wikipedia.org/wiki/Grand_Boulevard,_Chicago"
+html_page <- read_html(url)
+```
+
+Notice that the table containing the results we need have a html tag `table`and class `us-census-pop`.
+
+```{r}
+pop <- html_page %>%
+  html_element(css = "table.us-census-pop") %>%
+  html_table() %>%
+  dplyr::select(Census, Pop. , `%±`)
+```
+
+# Expanding to More Pages
+
+Find the index of adjacent table:
+
+```{r}
+tables <- html_page %>% html_nodes("table")
+
+for (i in seq_along(tables)) {
+  table_text <- html_text(tables[[i]])
+  if (grepl("Places adjacent to Grand Boulevard, Chicago", table_text)) {
+    print(paste("The correct table is at position", i))
+    correct_table <- tables[[i]]
+    break
+  }
+}
+```
+
+Since the places in the east are listed in the third column, we use css selector `tr td:nth-child(3)` to match the third column.
+
+Additionally, the places are with a link, therefore, change the css selector to `tr td:nth-child(3) a`:
+
+```{r}
+place_elements <- html_elements(correct_table, css = "tr td:nth-child(3) a")
+```
+
+Get the `href` attribute from the `a` tag elements. Combine with the base url:
+
+```{r}
+places <- data.frame(
+  place = html_attr(place_elements, "title"),
+  href = html_attr(place_elements, "href")
+) %>%
+  mutate(url = paste0("https://en.wikipedia.org", href))
+```
+
+Get the census pop table for each page and combine them into a list with names:
+
+```{r}
+get_census_pop <- function(url) {
+  url %>%
+    read_html() %>%
+    html_element(css = "table.us-census-pop") %>%
+    html_table() %>%
+    dplyr::select(Census, Pop. , `%±`)
+}
+
+pops <- c(list(pop), lapply(places$url, get_census_pop))
+names(pops) <- c("Grand Boulevard, Chicago", places$place)
+```
+
+Add a column about the place's name for each sub-table:
+
+```{r}
+pops <- lapply(
+  seq_along(pops),
+  function(i) {
+    pops[[i]] %>%
+      mutate(Place = names(pops)[i])
+  }
+)
+```
+
+Combine all the results:
+
+```{r,warning=FALSE}
+pops_longer <- purrr::reduce(pops, rbind) %>%
+  mutate(Census = as.integer(Census),
+         Pop. = stringr::str_replace(Pop., ",", ""),
+         Pop. = as.integer(Pop.),
+         `%±` = stringr::str_replace(`%±`, "%", ""),
+         `%±` = stringr::str_replace(`%±`, "−", "-"),
+         `%±` = as.numeric(`%±`) * 0.01) %>%
+  dplyr::filter(!is.na(Census))
+```
+
+Reshape to a wider form:
+
+```{r}
+pops_longer %>%
+  pivot_wider(id_cols = "Census", 
+              names_from = "Place", 
+              values_from = "Pop.") %>%
+  arrange(Census) %>%
+  knitr::kable()
+```
+
+About the percentage of changes:
+
+```{r}
+pops_longer %>%
+  pivot_wider(id_cols = "Census", 
+              names_from = "Place", 
+              values_from = "%±") %>%
+  arrange(Census) %>%
+  knitr::kable()
+```
+
+# Scraping and Analyzing Text Data
+
+Define function to scrap and clean text data. Notice the content are within a control
+with id `#mw-content-text` and text content (except table) can be scrapd by a series
+of css selectors:
+
+```{r}
+get_main_text <- function(html, collapse = TRUE) {
+  selector <- c("div.mw-content-ltr > div.mw-heading > h1", 
+                "div.mw-content-ltr > div.mw-heading > h2", 
+                "div.mw-content-ltr > div.mw-heading > h3", 
+                "div.mw-content-ltr > div.mw-heading > h4", 
+                "div.mw-content-ltr > div.mw-heading > h5", 
+                "div.mw-content-ltr > div.mw-heading > h6", 
+                "div.mw-content-ltr > p:not(.mw-empty-elt)", 
+                "div.mw-content-ltr > ul", 
+                "div.mw-content-ltr > ol") %>%
+    paste(collapse = ", ")
+  
+  text <- html %>%
+    html_elements(css = "#mw-content-text") %>%
+    html_elements(css = selector) %>%
+    html_text(trim = TRUE) %>%
+    stringr::str_replace_all("\\n", " ") %>%
+    stringr::str_replace_all("\\[\\d*?\\]", "")
+  if (collapse) return(paste(text, collapse = " "))
+  else return(text)
+}
+```
+
+Test for sample page:
+
+```{r}
+cat(get_main_text(html_page, collapse = FALSE), sep = "\n")
+```
+
+Get contents from all pages:
+
+```{r}
+descriptions <- places$url %>%
+  sapply(function(url) get_main_text(read_html(url)))
+descriptions <- c(get_main_text(html_page), descriptions)
+descriptions <- tibble(
+  name = c("Grand Boulevard, Chicago", places$place),
+  description = descriptions
+)
+```
+
+Create tokens and drop stop words:
+
+```{r,message=FALSE}
+library(tidytext)
+
+data("stop_words")
+
+tokens <- descriptions %>%
+  unnest_tokens(word, description) %>%
+  dplyr::filter(!(word %in% stop_words$word))
+```
+
+The most common words used overall are listed as follows:
+
+```{r}
+tokens %>%
+  group_by(word) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>%
+  head(5) %>%
+  knitr::kable()
+```
+
+The most common words within each location are as follows:
+
+```{r}
+tokens_area <- tokens %>%
+  group_by(name, word) %>%
+  summarise(n = n()) %>%
+  group_by(name) %>%
+  top_n(n = 10, wt = n)
+
+ggplot(tokens_area) +
+  geom_col(aes(x = n, y = word)) +
+  facet_wrap(. ~ name, ncol = 2, scales = "free_y") +
+  theme_bw()
+```
+
+There are some similarities and differences between these locations. 
+
+All of them show words "Chicago," and "street", along with names relevant to their specific areas, such as "grand", "boulevard", "hyde", "kenwood", and "oakland", reflecting a consistent interest in local addresses and the city itself. Meanwhile, words like "souch" and "avenue", though look different, both indicate their geographical positions. For instance, "south" appears in Grand Boulevard, Hyde Park, and Kenwood, reflecting their geographical location is further south to downtown Chicago, while Oakland, located in north, lacks this word. Additionally, "park" is another common word used in both Hyde Park and Kenwood, fitting given their neighboring positions and the presence of parks in both areas. This may also explain these two areas share the other's name in their searches. Such alignment of common words with their geographical locations show how these words are prominent features of the areas. Furthermore, three of these locations share the word "community", with Hyde Park uniquely using "neighborhood", highlighting their shared focus on neighborhood identity and community engagement.
+
+Interestingly, both Kenwood and Grand Boulevard include notable names "Obama" and "Marx". Even though they are not the same name, they exactly suggest the featured notable figures who lived or have lived in the corresponding areas. To be specific, the former President Barack Obama resides in Kenwood, while the famous American family comedy act, the Marx Brothers once lived in Grand Boulevard.
+
+Noticeably, Oakland stands out with words of "homes", "housing", "residents", "constructed", "building" that are specific to residential aspects and living situations; however, the others focus on more general area. As a matter of fact, Oakland is the area that situates closest to central Chicago.
+
+Lastly, only Hyde Park and Kenwood shows a word related to education: "university" in Hyde Park and "school" in Kenwood. This correlates with the presence of the word-renowed University of Chicago in area of Hyde Park and highly rated schools in Kenwood. These educational references, along with their neighboring geographical locations.
